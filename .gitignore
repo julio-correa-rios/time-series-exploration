@@ -3,6 +3,8 @@ __pycache__/
 .python-version
 .env
 mlruns/
+mlartifacts/
+mlflow.db
 *.pkl
 .DS_Store
 venv/
@@ -11,3 +13,4 @@ venv/
 dist/
 
 build/
+uv.lock

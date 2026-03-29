@@ -12,23 +12,38 @@ from features.pipeline import create_features
 
 tracker = MLFlowTracker(experiment_name="TimeSeries-Development")
 
-def train_model(df, run_name="training_v1"):
+def train_model(df, run_name=None):
     """
     Train a model with MLFlow tracking.
     
-    Each call to this function creates a new MLFlow run.
-    Multiple calls happen when drift is detected in the pipeline.
+    Each call to this function creates a new MLFlow run (if not nested).
+    When called from within an active run, logs to that run instead.
     
     Args:
         df: Input dataframe
-        run_name: Name for this training run
+        run_name: Name for this training run (auto-generated if None)
         
     Returns:
         Trained model
     """
     
-    # Use context manager for clean run handling
-    with MLFlowRun(tracker, run_name=run_name):
+    # Check if there's already an active run
+    active_run = mlflow.active_run()
+    is_nested = active_run is not None
+    
+    # Only create a new run if there isn't one already
+    if not is_nested:
+        if run_name is None:
+            import time
+            timestamp = int(time.time())
+            run_name = f"training_{timestamp}"
+        context_manager = MLFlowRun(tracker, run_name=run_name)
+    else:
+        # Use a dummy context manager that doesn't create a run
+        from contextlib import nullcontext
+        context_manager = nullcontext()
+
+    with context_manager:
         X, y = create_features(df)
         
         params = {
@@ -36,7 +51,7 @@ def train_model(df, run_name="training_v1"):
             "max_depth": 5,
             "learning_rate": 0.1,
         }
-        tracker.log_params(params)
+        mlflow.log_params(params)
         
         # Train model
         model = GradientBoostingRegressor(**params)
@@ -48,7 +63,7 @@ def train_model(df, run_name="training_v1"):
         rmse = np.sqrt(mean_squared_error(y, predictions))
         
         metrics = {"mae": mae, "rmse": rmse}
-        tracker.log_metrics(metrics)
+        mlflow.log_metrics(metrics)
         
         # Log model in pickle format
         mlflow.sklearn.log_model(
@@ -57,10 +72,5 @@ def train_model(df, run_name="training_v1"):
             serialization_format="pickle"
         )
     
-        # New to register the model in the MLFlow Model Registry:
-        # import mlflow
-        model_uri = f"runs://{mlflow.active_run().info.run_id}/model"
-        mlflow.register_model(model_uri, "TimeSeries-GradientBoosting")
-
     return model
 
