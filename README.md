@@ -121,7 +121,7 @@ Create a `.env` file in the project root:
 ```env
 # MLFlow
 MLFLOW_TRACKING_URI=http://localhost:5000
-MLFLOW_EXPERIMENT_NAME=TimeSeries-Development
+EXPERIMENT_NAME=TimeSeries-Development
 
 # Data configuration
 BUFFER_SIZE=100
