@@ -120,7 +120,9 @@ Create a `.env` file in the project root:
 
 ```env
 # MLFlow
-MLFLOW_TRACKING_URI=http://localhost:5000
+MLFLOW_TRACKING_URI=http://localhost:5001
+MLFLOW_BACKEND_STORE_URI=./mlruns
+MLFLOW_ARTIFACT_ROOT=./mlartifacts
 EXPERIMENT_NAME=TimeSeries-Development
 
 # Data configuration
@@ -143,10 +145,14 @@ See [config/settings.py](config/settings.py) for all configurable options.
 ### Start MLFlow Server
 
 ```bash
-mlflow server --host 0.0.0.0 --port 5000
+mlflow server \
+  --backend-store-uri ./mlruns \
+  --default-artifact-root ./mlartifacts \
+  --host 127.0.0.1 \
+  --port 5001
 ```
 
-Then access `http://localhost:5000` in your browser.
+Then access `http://localhost:5001` in your browser.
 
 ### Tracked Features
 

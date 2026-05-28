@@ -1,6 +1,7 @@
 from features.registry import FeatureRegistry
 from features.transformations import register_temporal_features
 
+import os
 
 registry = FeatureRegistry()
 
@@ -20,5 +21,6 @@ def create_features(df):
     X = df[feature_cols]
 
     y = df["load"]
+    os.makedirs("storage/features", exist_ok=True)
     df.to_parquet("storage/features/features.parquet")  
     return X, y
