@@ -1,76 +1,89 @@
-"""Model training with MLFlow tracking."""
+"""Model training with MLflow tracking."""
 
-import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.ensemble import GradientBoostingRegressor
+import time
+from contextlib import nullcontext
+
 import mlflow
 import mlflow.sklearn
+import numpy as np
+from mlflow.exceptions import MlflowException
+from mlflow.models.signature import infer_signature
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from features.pipeline import create_features
 from mlflow_integration import MLFlowTracker
 from mlflow_integration.tracking import MLFlowRun
-from features.pipeline import create_features
 
 tracker = MLFlowTracker(experiment_name="TimeSeries-Development")
 
-def train_model(df, run_name=None):
+FEATURES_PARQUET = "storage/features/features.parquet"
+
+
+def train_model(df, run_name=None, version=None):
     """
-    Train a model with MLFlow tracking.
-    
-    Each call to this function creates a new MLFlow run (if not nested).
-    When called from within an active run, logs to that run instead.
-    
+    Train a model with MLflow tracking.
+
+    When called inside an active MLflow run (e.g. from the streaming pipeline),
+    the model is logged at artifact_path=`model_v{version}` so retrains in the
+    same parent run never overwrite each other. When called standalone, a new
+    MLflow run is created and the model is logged at artifact_path=`model`.
+
     Args:
-        df: Input dataframe
-        run_name: Name for this training run (auto-generated if None)
-        
+        df: Input dataframe.
+        run_name: Optional run name when starting a fresh run.
+        version: Retrain version. When provided, used to namespace the model
+            artifact path and step the per-retrain mae/rmse metrics.
+
     Returns:
-        Trained model
+        Trained sklearn model.
     """
-    
-    # Check if there's already an active run
     active_run = mlflow.active_run()
     is_nested = active_run is not None
-    
-    # Only create a new run if there isn't one already
+
     if not is_nested:
         if run_name is None:
-            import time
-            timestamp = int(time.time())
-            run_name = f"training_{timestamp}"
+            run_name = f"training_{int(time.time())}"
         context_manager = MLFlowRun(tracker, run_name=run_name)
     else:
-        # Use a dummy context manager that doesn't create a run
-        from contextlib import nullcontext
         context_manager = nullcontext()
 
     with context_manager:
-        X, y = create_features(df)
-        
+        X, y = create_features(df, save_path=FEATURES_PARQUET)
+
         params = {
             "n_estimators": 100,
             "max_depth": 5,
             "learning_rate": 0.1,
         }
-        mlflow.log_params(params)
-        
-        # Train model
+        try:
+            mlflow.log_params(params)
+        except MlflowException:
+            # Streaming retrains call into the same parent run; identical params
+            # are fine, but mlflow rejects re-logging if values ever differ.
+            pass
+
         model = GradientBoostingRegressor(**params)
         model.fit(X, y)
-        
-        # Calculate and log metrics
+
         predictions = model.predict(X)
         mae = mean_absolute_error(y, predictions)
         rmse = np.sqrt(mean_squared_error(y, predictions))
-        
-        metrics = {"mae": mae, "rmse": rmse}
-        mlflow.log_metrics(metrics)
-        
-        # Log model in pickle format
-        mlflow.sklearn.log_model(
-            model, 
-            artifact_path="model",
-            serialization_format="pickle"
-        )
-    
-    return model
 
+        step = version if version is not None else 0
+        mlflow.log_metric("mae", mae, step=step)
+        mlflow.log_metric("rmse", rmse, step=step)
+
+        artifact_path = f"model_v{version}" if version is not None else "model"
+        signature = infer_signature(X, predictions)
+        input_example = X.iloc[:5]
+
+        mlflow.sklearn.log_model(
+            model,
+            artifact_path=artifact_path,
+            serialization_format="pickle",
+            signature=signature,
+            input_example=input_example,
+        )
+
+    return model

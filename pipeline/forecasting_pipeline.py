@@ -1,109 +1,147 @@
-import pandas as pd
-import mlflow
+"""Streaming forecast pipeline with drift detection, MLflow tracking, and graceful shutdown."""
 
-from models.training import train_model
-from models.inference import predict
-from models.registry import ModelRegistry
-from monitoring.drift import detect_drift
+import signal
+import time
+
+import mlflow
+import pandas as pd
+
 from config.settings import BUFFER_SIZE
 from mlflow_integration import MLFlowTracker
+from models.inference import predict
+from models.training import train_model
+from monitoring.drift import detect_drift
 
 
 class ForecastPipeline:
-    """Time series forecasting pipeline with drift detection and MLFlow tracking."""
+    """Time series forecasting pipeline with drift detection and MLflow tracking."""
 
     def __init__(self):
-
         self.buffer = []
         self.model = None
         self.version = 0
-        self.step = 0  # Track prediction step for MLFlow
-        
-        self.registry = ModelRegistry()
-        
-        # Initialize MLFlow tracker
+        self.step = 0
+
         self.tracker = MLFlowTracker(experiment_name="TimeSeries-Development")
         self.active_run = None
 
-    def ingest(self, observation):
+        self._shutdown_requested = False
+        self.was_killed = False
 
+    def ingest(self, observation):
         self.buffer.append(observation)
 
     def retrain(self, reason="initial"):
         """
-        Retrain the model and log to MLFlow.
-        
-        Args:
-            reason: Why retraining happened ("initial" or "drift_detected")
+        Retrain the model and log the new version to MLflow.
+
+        Each retrain bumps `self.version` and the new model is logged at
+        artifact_path=`model_v{version}` inside the active streaming run, so
+        retrains in the same simulation never overwrite each other.
         """
-
         df = pd.DataFrame(self.buffer)
-
-        self.model = train_model(df)
-
         self.version += 1
+        self.model = train_model(df, version=self.version)
 
-        self.registry.save(self.model, self.version)
-        
-        # Log retraining event to MLFlow as metric (not param, to allow multiple updates)
-        if self.active_run:
+        if self.active_run is not None:
             mlflow.log_metric("retrain_count", self.version, step=self.step)
+            mlflow.set_tag(f"retrain_v{self.version}_reason", reason)
+
+    # Enough history to compute lag_12 + rolling_mean(12) + one prediction row.
+    _PREDICT_TAIL = 50
 
     def forecast(self):
-
-        df = pd.DataFrame(self.buffer)
-
+        # Predicting the next step only needs a small recent tail; passing the
+        # full buffer makes feature engineering O(N) on every step.
+        tail = self.buffer[-self._PREDICT_TAIL:]
+        df = pd.DataFrame(tail)
         return predict(self.model, df)
+
+    def _install_sigint_handler(self):
+        """Install a two-stage SIGINT handler. First press drains, second forces exit."""
+        original = signal.getsignal(signal.SIGINT)
+
+        def handler(signum, frame):
+            if self._shutdown_requested:
+                # Second Ctrl+C: restore default and let the next press kill us.
+                signal.signal(signal.SIGINT, original)
+                print("\nForce quit requested. Exiting now.")
+                raise KeyboardInterrupt
+            self._shutdown_requested = True
+            print(
+                "\nShutdown requested. Finishing the current step and closing the "
+                "MLflow run cleanly. Press Ctrl+C again to force quit."
+            )
+
+        signal.signal(signal.SIGINT, handler)
+        return original
 
     def run(self, stream):
         """
-        Run the streaming pipeline with drift detection and MLFlow tracking.
-        
+        Run the streaming pipeline with drift detection, MLflow tracking, and
+        graceful shutdown.
+
         Args:
-            stream: Iterator of observations
+            stream: Iterator of observations (each obs has `load`, `temperature`, ...).
         """
-        
-        # Start MLFlow run for this streaming session
-        import time
-        timestamp = int(time.time())
-        run_name = f"streaming_{timestamp}"
+        original_handler = self._install_sigint_handler()
+
+        run_name = f"streaming_{int(time.time())}"
         self.active_run = self.tracker.start_run(run_name)
 
-        for obs in stream:
+        final_status = "FINISHED"
 
-            self.ingest(obs)
+        try:
+            for obs in stream:
+                if self._shutdown_requested:
+                    final_status = "KILLED"
+                    self.was_killed = True
+                    break
 
-            if len(self.buffer) < BUFFER_SIZE:
-                continue
+                self.ingest(obs)
 
-            if self.model is None:
-                self.retrain(reason="initial")
+                if len(self.buffer) < BUFFER_SIZE:
+                    continue
 
-            prediction = self.forecast()
+                if self.model is None:
+                    self.retrain(reason="initial")
 
-            actual = obs["load"]
+                prediction = self.forecast()
+                actual = obs["load"]
+                error = abs(prediction - actual)
 
-            error = abs(prediction - actual)
+                self.step += 1
+                mlflow.log_metrics(
+                    {
+                        "prediction": prediction,
+                        "actual": actual,
+                        "error": error,
+                    },
+                    step=self.step,
+                )
 
-            # Log prediction metrics to MLFlow
-            self.step += 1
-            mlflow.log_metric("prediction", prediction, step=self.step)
-            mlflow.log_metric("actual", actual, step=self.step)
-            mlflow.log_metric("error", error, step=self.step)
+                print(
+                    f"Actual {actual:.1f} | "
+                    f"Pred {prediction:.1f} | "
+                    f"Error {error:.1f}"
+                )
 
+                if detect_drift(error):
+                    print("Drift detected -> retraining")
+                    mlflow.log_metric("drift_detected", 1, step=self.step)
+                    self.retrain(reason="drift_detected")
+        except KeyboardInterrupt:
+            final_status = "KILLED"
+            self.was_killed = True
+            raise
+        except Exception:
+            final_status = "FAILED"
+            raise
+        finally:
+            if mlflow.active_run() is not None:
+                mlflow.end_run(status=final_status)
+            signal.signal(signal.SIGINT, original_handler)
             print(
-                f"Actual {actual:.1f} | "
-                f"Pred {prediction:.1f} | "
-                f"Error {error:.1f}"
+                f"\nRun ended. status={final_status} "
+                f"steps={self.step} retrains={self.version}"
             )
-
-            if detect_drift(error):
-                print("Drift detected → retraining")
-                
-                # Log drift event to MLFlow
-                mlflow.log_metric("drift_detected", 1, step=self.step)
-
-                self.retrain(reason="drift_detected")
-        
-        # End the MLFlow run
-        self.tracker.end_run()

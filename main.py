@@ -1,29 +1,23 @@
-# Standard library
-import logging
+"""Entry point: generate data, stream it, and run the forecasting pipeline."""
 
-# Third-party
-import pandas as pd
+import sys
 
-# # Add paths
-# import sys
-# import os
-
-# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Local modules
 from data_simulation.generator import generate_grid_data
 from data_simulation.stream import stream_data
 from pipeline.forecasting_pipeline import ForecastPipeline
 
+
 def main():
-
     data = generate_grid_data()
-
     stream = stream_data(data)
 
     pipeline = ForecastPipeline()
 
-    pipeline.run(stream)
+    try:
+        pipeline.run(stream)
+    except KeyboardInterrupt:
+        print("Streaming interrupted by user. Exiting.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
