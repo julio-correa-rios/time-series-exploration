@@ -1,7 +1,9 @@
 """Streaming forecast pipeline with drift detection, MLflow tracking, and graceful shutdown."""
 
+import os
 import signal
 import time
+from collections import deque
 
 import mlflow
 import pandas as pd
@@ -9,7 +11,7 @@ import pandas as pd
 from config.settings import BUFFER_SIZE
 from mlflow_integration import MLFlowTracker
 from models.inference import predict
-from models.training import train_model
+from models.training import FEATURES_PARQUET, train_model
 from monitoring.drift import detect_drift
 
 
@@ -17,7 +19,10 @@ class ForecastPipeline:
     """Time series forecasting pipeline with drift detection and MLflow tracking."""
 
     def __init__(self):
-        self.buffer = []
+        # Bounded rolling window: keeps memory + per-retrain cost flat as the
+        # stream grows. Each retrain trains on exactly the last BUFFER_SIZE
+        # observations rather than the full history.
+        self.buffer: "deque" = deque(maxlen=BUFFER_SIZE)
         self.model = None
         self.version = 0
         self.step = 0
@@ -51,9 +56,9 @@ class ForecastPipeline:
     _PREDICT_TAIL = 50
 
     def forecast(self):
-        # Predicting the next step only needs a small recent tail; passing the
-        # full buffer makes feature engineering O(N) on every step.
-        tail = self.buffer[-self._PREDICT_TAIL:]
+        # Predicting the next step only needs a small recent tail. deque does
+        # not support slice indexing, so convert to list and then slice.
+        tail = list(self.buffer)[-self._PREDICT_TAIL:]
         df = pd.DataFrame(tail)
         return predict(self.model, df)
 
@@ -139,6 +144,15 @@ class ForecastPipeline:
             raise
         finally:
             if mlflow.active_run() is not None:
+                # Log the final features parquet ONCE per run. Doing this per
+                # retrain caused growing-file uploads on every drift event.
+                if os.path.exists(FEATURES_PARQUET):
+                    try:
+                        mlflow.log_artifact(
+                            FEATURES_PARQUET, artifact_path="features"
+                        )
+                    except Exception as exc:
+                        print(f"Could not log final features artifact: {exc}")
                 mlflow.end_run(status=final_status)
             signal.signal(signal.SIGINT, original_handler)
             print(

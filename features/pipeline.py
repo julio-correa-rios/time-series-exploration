@@ -1,8 +1,6 @@
 import os
 from typing import Optional
 
-import mlflow
-
 from features.registry import FeatureRegistry
 from features.transformations import register_temporal_features
 
@@ -15,14 +13,15 @@ def create_features(df, save_path: Optional[str] = None):
     Compute model features.
 
     When `save_path` is provided, the engineered dataframe is written to that
-    path as parquet (a transient staging file) and, if an MLflow run is
-    currently active, also logged via `mlflow.log_artifact` under
-    `artifact_path="features"` so each simulation owns its own copy.
+    path as parquet (a transient local staging file). Uploading the parquet
+    to MLflow is intentionally NOT done here on every call: in a streaming
+    pipeline this would re-upload a growing file on every retrain. The
+    pipeline runner takes a single final snapshot at end-of-run.
 
     Args:
         df: Raw observations dataframe.
         save_path: Optional parquet path. When None (e.g. inference path), no
-            file is written and no MLflow artifact is logged.
+            file is written.
 
     Returns:
         Tuple `(X, y)` of features and target.
@@ -41,10 +40,5 @@ def create_features(df, save_path: Optional[str] = None):
         if parent:
             os.makedirs(parent, exist_ok=True)
         df.to_parquet(save_path)
-        if mlflow.active_run() is not None:
-            try:
-                mlflow.log_artifact(save_path, artifact_path="features")
-            except Exception as exc:
-                print(f"Skipped logging features artifact: {exc}")
 
     return X, y
