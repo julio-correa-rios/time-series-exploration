@@ -1,5 +1,6 @@
 """Model training with MLflow tracking."""
 
+import tempfile
 import time
 from contextlib import nullcontext
 
@@ -19,21 +20,42 @@ tracker = MLFlowTracker(experiment_name="TimeSeries-Development")
 
 FEATURES_PARQUET = "storage/features/features.parquet"
 
+# Explicit pip requirements for the logged model.
+#
+# Why this is set explicitly:
+#   When `pip_requirements` is None (the default), MLflow spawns a child
+#   Python subprocess on every `log_model` call to introspect imports and
+#   infer the environment (~1.3s baseline). In long-running streaming runs
+#   the cost of that subprocess grows with the parent's memory (fork has
+#   to copy-on-write more pages), so by the 15th-20th retrain a single
+#   log_model can take 15+ seconds, which is what was making the pipeline
+#   feel "frozen" after roughly a dozen drift events.
+#
+# Listing the runtime deps here makes log_model O(50ms) and constant.
+# Versions are intentionally unpinned so the captured env tracks whatever
+# is installed in this venv; tighten later if reproducibility matters.
+_LOG_MODEL_PIP_REQUIREMENTS = [
+    "scikit-learn",
+    "numpy",
+    "pandas",
+    "mlflow",
+]
+
 
 def train_model(df, run_name=None, version=None):
     """
     Train a model with MLflow tracking.
 
     When called inside an active MLflow run (e.g. from the streaming pipeline),
-    the model is logged at artifact_path=`model_v{version}` so retrains in the
-    same parent run never overwrite each other. When called standalone, a new
-    MLflow run is created and the model is logged at artifact_path=`model`.
+    the model is logged as a named logged-model `model_v{version}` so retrains
+    in the same parent run never overwrite each other. When called standalone,
+    a new MLflow run is created and the model is logged as `model`.
 
     Args:
         df: Input dataframe.
         run_name: Optional run name when starting a fresh run.
         version: Retrain version. When provided, used to namespace the model
-            artifact path and step the per-retrain mae/rmse metrics.
+            and step the per-retrain mae/rmse metrics.
 
     Returns:
         Trained sklearn model.
@@ -74,16 +96,34 @@ def train_model(df, run_name=None, version=None):
         mlflow.log_metric("mae", mae, step=step)
         mlflow.log_metric("rmse", rmse, step=step)
 
-        artifact_path = f"model_v{version}" if version is not None else "model"
+        model_name = f"model_v{version}" if version is not None else "model"
         signature = infer_signature(X, predictions)
         input_example = X.iloc[:5]
 
-        mlflow.sklearn.log_model(
-            model,
-            artifact_path=artifact_path,
-            serialization_format="pickle",
-            signature=signature,
-            input_example=input_example,
-        )
+        # We deliberately avoid `mlflow.sklearn.log_model(...)` here.
+        #
+        # In MLflow 3, `log_model` creates a "Logged Model" entity and calls
+        # `log_model_metrics_for_step`, which fetches the run's *entire* metric
+        # history and re-attaches it to the new model on every call. In a long
+        # streaming run that means each retrain becomes O(N) in the number of
+        # accumulated metric points, and `log_model` time roughly doubles per
+        # drift event - going from ~0.1s early on to >25s by the 19th retrain.
+        #
+        # `save_model` writes the same MLflow model package to a local path,
+        # and `log_artifacts` uploads it under a per-version artifact path.
+        # The run still gets a full, loadable model artifact tree per retrain
+        # (visible in the UI under `artifacts/model_v{N}/`), but without the
+        # quadratic metric-correlation work.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = f"{tmp_dir}/model"
+            mlflow.sklearn.save_model(
+                model,
+                path=model_path,
+                serialization_format="pickle",
+                signature=signature,
+                input_example=input_example,
+                pip_requirements=_LOG_MODEL_PIP_REQUIREMENTS,
+            )
+            mlflow.log_artifacts(model_path, artifact_path=model_name)
 
     return model
