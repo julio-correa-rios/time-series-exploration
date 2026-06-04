@@ -15,3 +15,6 @@ dist/
 build/
 uv.lock
 storage/
+
+mlruns_archive_bloated/
+mlartifacts_archive_bloated/
