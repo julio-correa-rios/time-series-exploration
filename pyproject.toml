@@ -26,6 +26,9 @@ airflow = [
 aws = [
     "boto3>=1.26.0",
 ]
+kafka = [
+    "confluent-kafka>=2.3.0",
+]
 
 [build-system]
 requires = ["setuptools>=45", "wheel"]
