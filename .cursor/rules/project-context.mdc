@@ -1,0 +1,66 @@
+---
+description: Project context for the time-series streaming forecasting demo
+alwaysApply: true
+---
+
+# time-series-exploration — project context
+
+Streaming time-series forecasting demo with drift detection, retraining,
+and MLflow 3 tracking. Synthetic grid-load data, GradientBoostingRegressor,
+file-based MLflow store. Local dev only.
+
+## Run it
+
+- `make mlflow-server` — MLflow UI at `http://localhost:5001`
+  (host=127.0.0.1, backend=`./mlruns`, artifact root=`./mlartifacts`)
+- `make streaming` / `python run_streaming.py` — in-process synthetic
+  stream, retrains on drift, registers best model at the end.
+- Kafka path (branch `feature/kafka-streaming`, requires `uv sync --extra kafka`):
+  - `make kafka-workflow` — prints the multi-terminal demo steps
+  - `make mlflow-server` + `make kafka-up` — start both before producer/consumer
+  - `make check-deps` — preflight (MLflow `:5001` + Kafka `:19092`)
+  - `make kafka-producer` / `make streaming-kafka` — fail fast if deps are down
+  - `make kafka-monitor` — second consumer group (learning exercise)
+  - With uv: `make streaming-kafka PYTHON="uv run --extra kafka python"`
+  - See `docs/kafka-learning.md` for replay/resume exercises.
+- Ctrl+C is graceful (two-stage SIGINT). Run gets status=KILLED, no register.
+
+## MLflow store layout
+
+- `mlruns/` = backend (metadata, metric files, params, tags).
+- `mlartifacts/` = artifact store (model packages, parquet features).
+- Both are gitignored. Local archive of pre-fix bloated runs lives in
+  `mlruns_archive_bloated/` + `mlartifacts_archive_bloated/`.
+- Active experiment id `906404254415785531` = `TimeSeries-Development`.
+
+## Streaming-cost landmines (do NOT regress)
+
+- `ForecastPipeline.buffer` is `collections.deque(maxlen=BUFFER_SIZE)`.
+  Never make it an unbounded list — training cost has to stay flat.
+- Do NOT call `mlflow.sklearn.log_model(name=...)` per retrain. MLflow 3
+  runs `log_model_metrics_for_step` inside `log_model`, which fetches and
+  re-attaches the run's full metric history every call → O(N²) → 25s+
+  per retrain by v19. We use `mlflow.sklearn.save_model` to a temp dir
+  then `mlflow.log_artifacts(...)`.
+- Always pass `pip_requirements=[...]` explicitly. Default (`None`) spawns
+  a per-call subprocess for env introspection (~1.3s baseline, grows
+  with parent-process memory).
+- `create_features` writes parquet locally only. The pipeline runner
+  uploads `storage/features/features.parquet` once in its `finally`
+  block. Do not log it per retrain.
+
+## Key files
+
+- `pipeline/forecasting_pipeline.py` — loop, drift, graceful shutdown.
+- `models/training.py` — train + save_model + log_artifacts.
+- `models/registry.py` — best-model registration. Known follow-up: the
+  `_latest_model_artifact_path` lookup hangs against MLflow 3's logged-
+  model resolution; use `--no-register` or register from the UI.
+- `scripts/migrate_artifacts.py` — idempotent cleanup of legacy paths.
+- `data_simulation/kafka_stream.py` — Kafka iterator adapter for the pipeline.
+- `run_kafka_producer.py` / `run_streaming_kafka.py` — Kafka produce/consume entry points.
+
+## Pending
+
+- Fix `register_best_model` for MLflow 3 layout.
+- Merge `feature/kafka-streaming` after end-to-end Kafka workflow is verified.
